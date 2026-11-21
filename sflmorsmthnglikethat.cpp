@@ -1,4 +1,6 @@
 #include <SFML/Graphics.hpp>
+#include <SFML/Audio.hpp>
+#include <memory>
 #include <time.h>
 #include <cstdlib>
 #include <fstream>
@@ -243,6 +245,213 @@ void fxBackground(RenderWindow& w) {
 	}
 }
 
+/* =====================================================================
+   AUDIO LAYER  (front-end only). All sounds are synthesised in code, so no
+   audio files are needed. It only OBSERVES game variables (never writes
+   them) and reacts when they change.
+   ===================================================================== */
+const unsigned SFX_RATE = 44100;
+enum {
+	SFX_HIT, SFX_BREAK, SFX_PADDLE, SFX_WALL, SFX_LAUNCH, SFX_LOSELIFE, SFX_SPAWN,
+	SFX_POWERUP, SFX_ONEUP, SFX_EXPIRE, SFX_MOVE, SFX_SELECT, SFX_WIN, SFX_LOSE,
+	SFX_NOSAVE, SFX_COUNT
+};
+SoundBuffer sfxBuffers[SFX_COUNT];
+SoundBuffer sfxMusicBuffer;
+vector<unique_ptr<Sound>> sfxSounds;
+unique_ptr<Sound> sfxMusic;
+bool sfxReady = false, sfxTried = false, sfxMuted = false;
+
+float synMidi(int m) { return 440.f * pow(2.f, (m - 69) / 12.f); }
+
+// wave: 0 sine, 1 square, 2 triangle, 3 saw, 4 noise
+void synNote(vector<float>& m, float t0, float f0, float f1, float dur, int wave, float vol, float decay = 2.f) {
+	size_t s0 = (size_t)(t0 * SFX_RATE), n = (size_t)(dur * SFX_RATE);
+	if (m.size() < s0 + n) m.resize(s0 + n, 0.f);
+	float phase = 0.f;
+	unsigned nz = 2463534242u + (unsigned)s0;
+	for (size_t i = 0; i < n; i++) {
+		float t = (float)i / (float)n;
+		float f = f0 + (f1 - f0) * t;
+		phase += f / SFX_RATE;
+		phase -= floor(phase);
+		float v;
+		if (wave == 0) v = sin(2.f * FX_PI * phase);
+		else if (wave == 1) v = phase < 0.5f ? 1.f : -1.f;
+		else if (wave == 2) v = 4.f * fabsf(phase - 0.5f) - 1.f;
+		else if (wave == 3) v = 2.f * phase - 1.f;
+		else { nz ^= nz << 13; nz ^= nz >> 17; nz ^= nz << 5; v = (nz & 0xFFFF) / 32767.5f - 1.f; }
+		float att = (float)i / (0.004f * SFX_RATE);
+		if (att > 1.f) att = 1.f;
+		m[s0 + i] += v * vol * att * pow(1.f - t, decay);
+	}
+}
+
+bool synToBuffer(SoundBuffer& b, vector<float>& m) {
+	if (m.empty()) return false;
+	vector<int16_t> s(m.size());
+	for (size_t i = 0; i < m.size(); i++) {
+		float x = m[i];
+		if (x > 1.f) x = 1.f;
+		if (x < -1.f) x = -1.f;
+		s[i] = (int16_t)(x * 30000.f);
+	}
+	return b.loadFromSamples(s.data(), s.size(), 1, SFX_RATE, { SoundChannel::Mono });
+}
+
+void sfxInit() {
+	sfxTried = true;
+	vector<float> m;
+	bool ok = true;
+
+	m.clear(); synNote(m, 0, 700, 900, 0.08f, 2, 0.5f, 1.5f); synNote(m, 0, 1400, 1400, 0.025f, 1, 0.12f, 1.f);
+	ok &= synToBuffer(sfxBuffers[SFX_HIT], m);
+	m.clear(); synNote(m, 0, 0, 0, 0.18f, 4, 0.35f, 2.f); synNote(m, 0, 520, 140, 0.2f, 0, 0.45f, 2.f);
+	ok &= synToBuffer(sfxBuffers[SFX_BREAK], m);
+	m.clear(); synNote(m, 0, 220, 340, 0.09f, 1, 0.28f, 1.5f);
+	ok &= synToBuffer(sfxBuffers[SFX_PADDLE], m);
+	m.clear(); synNote(m, 0, 190, 140, 0.06f, 0, 0.5f, 1.5f);
+	ok &= synToBuffer(sfxBuffers[SFX_WALL], m);
+	m.clear(); synNote(m, 0, 300, 900, 0.25f, 0, 0.4f, 0.8f); synNote(m, 0, 150, 450, 0.25f, 2, 0.25f, 0.8f);
+	ok &= synToBuffer(sfxBuffers[SFX_LAUNCH], m);
+	m.clear(); synNote(m, 0, 420, 70, 0.55f, 3, 0.3f, 1.2f); synNote(m, 0, 210, 35, 0.55f, 0, 0.3f, 1.2f);
+	ok &= synToBuffer(sfxBuffers[SFX_LOSELIFE], m);
+	m.clear(); synNote(m, 0, 880, 880, 0.06f, 1, 0.15f, 1.f); synNote(m, 0.07f, 1175, 1175, 0.08f, 1, 0.15f, 1.f);
+	ok &= synToBuffer(sfxBuffers[SFX_SPAWN], m);
+	{
+		int n[4] = { 72, 76, 79, 84 };
+		m.clear();
+		for (int i = 0; i < 4; i++) {
+			synNote(m, i * 0.07f, synMidi(n[i]), synMidi(n[i]), 0.14f, 2, 0.4f, 1.2f);
+			synNote(m, i * 0.07f, synMidi(n[i]), synMidi(n[i]), 0.14f, 1, 0.1f, 1.2f);
+		}
+		ok &= synToBuffer(sfxBuffers[SFX_POWERUP], m);
+	}
+	{
+		int n[6] = { 76, 79, 88, 84, 88, 91 };
+		m.clear();
+		for (int i = 0; i < 6; i++)
+			synNote(m, i * 0.07f, synMidi(n[i]), synMidi(n[i]), 0.12f, 1, 0.2f, 1.2f);
+		ok &= synToBuffer(sfxBuffers[SFX_ONEUP], m);
+	}
+	m.clear(); synNote(m, 0, 400, 200, 0.25f, 2, 0.4f, 1.f);
+	ok &= synToBuffer(sfxBuffers[SFX_EXPIRE], m);
+	m.clear(); synNote(m, 0, 800, 800, 0.04f, 0, 0.35f, 1.f);
+	ok &= synToBuffer(sfxBuffers[SFX_MOVE], m);
+	m.clear(); synNote(m, 0, 500, 1000, 0.14f, 1, 0.2f, 1.f); synNote(m, 0, 500, 1000, 0.14f, 2, 0.3f, 1.f);
+	ok &= synToBuffer(sfxBuffers[SFX_SELECT], m);
+	{
+		int n[6] = { 72, 76, 79, 84, 79, 84 };
+		float t[6] = { 0.f, 0.15f, 0.3f, 0.45f, 0.6f, 0.8f };
+		float d[6] = { 0.14f, 0.14f, 0.14f, 0.14f, 0.14f, 0.6f };
+		m.clear();
+		for (int i = 0; i < 6; i++) {
+			synNote(m, t[i], synMidi(n[i]), synMidi(n[i]), d[i], 1, 0.2f, 1.f);
+			synNote(m, t[i], synMidi(n[i] - 12), synMidi(n[i] - 12), d[i], 2, 0.25f, 1.f);
+		}
+		ok &= synToBuffer(sfxBuffers[SFX_WIN], m);
+	}
+	{
+		int n[4] = { 67, 64, 60, 55 };
+		float t[4] = { 0.f, 0.25f, 0.5f, 0.75f };
+		float d[4] = { 0.22f, 0.22f, 0.22f, 0.8f };
+		m.clear();
+		for (int i = 0; i < 4; i++) {
+			synNote(m, t[i], synMidi(n[i]), synMidi(n[i]) * 0.97f, d[i], 3, 0.2f, 1.f);
+			synNote(m, t[i], synMidi(n[i] - 12), synMidi(n[i] - 12), d[i], 2, 0.25f, 1.f);
+		}
+		ok &= synToBuffer(sfxBuffers[SFX_LOSE], m);
+	}
+	m.clear(); synNote(m, 0, 150, 150, 0.1f, 1, 0.25f, 0.5f); synNote(m, 0.14f, 150, 150, 0.12f, 1, 0.25f, 0.5f);
+	ok &= synToBuffer(sfxBuffers[SFX_NOSAVE], m);
+
+	// background music loop: Am - F - C - G chiptune
+	{
+		const float step = 0.2f;
+		int chord[4][3] = { {57,60,64}, {53,57,60}, {60,64,67}, {55,59,62} };
+		int root[4] = { 45, 41, 48, 43 };
+		int arp[8] = { 0,1,2,1,0,1,2,1 };
+		int lead[32] = { 81,-1,-1,79,-1,76,-1,-1,  77,-1,-1,76,-1,72,-1,-1,
+						 79,-1,-1,76,-1,72,-1,76,  74,-1,-1,79,-1,71,-1,-1 };
+		m.clear();
+		for (int s = 0; s < 32; s++) {
+			int c = s / 8, k = s % 8;
+			float t = s * step;
+			synNote(m, t, synMidi(chord[c][arp[k]] + 12), synMidi(chord[c][arp[k]] + 12), 0.22f, 2, 0.10f, 1.5f);
+			if (k == 0 || k == 4) synNote(m, t, synMidi(root[c]), synMidi(root[c]), 0.38f, 2, 0.22f, 1.2f);
+			if (k % 2 == 1) synNote(m, t, 0, 0, 0.04f, 4, 0.04f, 3.f);
+			if (lead[s] >= 0) synNote(m, t, synMidi(lead[s]), synMidi(lead[s]), 0.3f, 1, 0.045f, 1.f);
+		}
+		m.resize((size_t)(32 * step * SFX_RATE));
+		ok &= synToBuffer(sfxMusicBuffer, m);
+	}
+
+	if (!ok) return;
+	for (int i = 0; i < SFX_COUNT; i++)
+		sfxSounds.push_back(make_unique<Sound>(sfxBuffers[i]));
+	sfxMusic = make_unique<Sound>(sfxMusicBuffer);
+	sfxMusic->setLooping(true);
+	sfxMusic->setVolume(28.f);
+	sfxReady = true;
+}
+
+void sfxPlay(int id, float pitch = 1.f) {
+	if (!sfxReady || id < 0 || id >= SFX_COUNT) return;
+	sfxSounds[id]->stop();
+	sfxSounds[id]->setPitch(pitch);
+	sfxSounds[id]->play();
+}
+
+// called once per frame from the three draw functions: reacts to state changes
+void audioTick() {
+	if (!sfxTried) sfxInit();
+	if (!sfxReady) return;
+
+	static bool pM = false;
+	bool mNow = Keyboard::isKeyPressed(Keyboard::Key::M);
+	if (mNow && !pM) {
+		sfxMuted = !sfxMuted;
+		Listener::setGlobalVolume(sfxMuted ? 0.f : 100.f);
+	}
+	pM = mNow;
+
+	// music: plays on menu and in game, silent on the game-over screen
+	if (gamestate == GAMEOVER) {
+		if (sfxMusic->getStatus() == SoundSource::Status::Playing) sfxMusic->stop();
+	}
+	else {
+		sfxMusic->setVolume(gamestate == MENU ? 20.f : 28.f);
+		if (sfxMusic->getStatus() != SoundSource::Status::Playing) sfxMusic->play();
+	}
+
+	static bool init = false;
+	static int pState = 0, pSel = 0, pLives = 0, pDx = 0, pDy = 0;
+	static bool pStart = false, pWide = false, pPower = false, pNosave = false;
+
+	if (init) {
+		if (gamestate == MENU && pState == MENU) {
+			if (selectedOption != pSel) sfxPlay(SFX_MOVE);
+			if (showNosave && !pNosave) sfxPlay(SFX_NOSAVE);
+		}
+		if (pState == MENU && gamestate == PLAYING) sfxPlay(SFX_SELECT);
+		if (pState == PLAYING && gamestate == PLAYING) {
+			if (gamestart && !pStart) sfxPlay(SFX_LAUNCH);
+			if (lives < pLives) sfxPlay(SFX_LOSELIFE);
+			if (lives > pLives) sfxPlay(SFX_ONEUP);
+			if (wideactive && !pWide) sfxPlay(SFX_POWERUP);
+			if (!wideactive && pWide) sfxPlay(SFX_EXPIRE);
+			if (power && !pPower) sfxPlay(SFX_SPAWN);
+			if (pDy > 0 && dy < 0 && ballY > 600) sfxPlay(SFX_PADDLE);
+			else if (pDy < 0 && dy > 0 && ballY <= 51) sfxPlay(SFX_WALL);
+			else if (pDx * dx < 0 && (ballX <= 1 || ballX >= 587)) sfxPlay(SFX_WALL);
+		}
+		if (pState == PLAYING && gamestate == GAMEOVER) sfxPlay(won ? SFX_WIN : SFX_LOSE);
+	}
+	init = true;
+	pState = gamestate; pSel = selectedOption; pLives = lives; pDx = dx; pDy = dy;
+	pStart = gamestart; pWide = wideactive; pPower = power; pNosave = showNosave;
+}
+
 /* ---- particles ---- */
 struct FxParticle { float x, y, vx, vy, life, maxlife, size; Color col; };
 vector<FxParticle> fxParticles;
@@ -271,6 +480,15 @@ void fxTrackBricks(bool spawn) {
 			for (int c = 0; c < 10; c++)
 				if (bricks[r][c] < fxPrevBricks[r][c]) changes++;
 		if (changes > 0 && changes <= 4) {
+			bool broke = false; int maxRemain = 0;
+			for (int r = 0; r < 8; r++)
+				for (int c = 0; c < 10; c++)
+					if (bricks[r][c] < fxPrevBricks[r][c]) {
+						if (bricks[r][c] == 0) broke = true;
+						else maxRemain = max(maxRemain, bricks[r][c]);
+					}
+			if (broke) sfxPlay(SFX_BREAK);
+			else sfxPlay(SFX_HIT, 0.85f + 0.15f * maxRemain);
 			for (int r = 0; r < 8; r++)
 				for (int c = 0; c < 10; c++)
 					if (bricks[r][c] < fxPrevBricks[r][c]) {
@@ -727,6 +945,7 @@ void fxDrawBall(RenderWindow& w) {
 
 void drawGameOver(RenderWindow& window) {
 	fxTick();
+	audioTick();
 	fxTrackBricks(false);
 
 	window.clear(Color(20, 20, 35));
@@ -737,7 +956,7 @@ void drawGameOver(RenderWindow& window) {
 	for (int i = 0; i < 70; i++) {
 		float x = fmodf(i * 83.17f + 30.f * sin(fxNow + i), 600.f);
 		float y = won ? fmodf(i * 41.3f + fxNow * (60.f + (i % 5) * 25.f), 720.f)
-		              : 720.f - fmodf(i * 41.3f + fxNow * (30.f + (i % 5) * 15.f), 720.f);
+			: 720.f - fmodf(i * 41.3f + fxNow * (30.f + (i % 5) * 15.f), 720.f);
 		cf.setSize({ 5.f, 8.f });
 		cf.setOrigin({ 2.5f, 4.f });
 		cf.setRotation(degrees(fxNow * 180.f + i * 40.f));
@@ -892,13 +1111,13 @@ void update() {
 		if (dy > 0 && (ballY + 12 >= 650 && ballY <= 664) && (ballX >= paddleX - 12 && ballX <= paddleX + 100)) {
 			dy = -5;
 			ballY = 638;
-			if (ballX + 6 >= paddleX && ballX + 6 < paddleX + 25)
+			if (ballX + 12 >= paddleX && ballX + 12 < paddleX + 25)
 				dx = -5;
-			else if (ballX + 6 >= paddleX + 25 && ballX + 6 < paddleX + 50)
+			else if (ballX + 12 >= paddleX + 25 && ballX + 12 < paddleX + 50)
 				dx = -3;
-			else if (ballX + 6 >= paddleX + 50 && ballX + 6 < paddleX + 75)
+			else if (ballX + 12 >= paddleX + 50 && ballX + 12 < paddleX + 75)
 				dx = 3;
-			else if (ballX + 6 >= paddleX + 75 && ballX + 6 <= paddleX + 100)
+			else if (ballX + 12 >= paddleX + 75 && ballX <= paddleX + 100)
 				dx = 5;
 		}
 	}
@@ -909,13 +1128,13 @@ void update() {
 			dy = -5;
 			ballY = 638;
 
-			if (ballX + 6 >= paddleX && ballX + 6 < paddleX + 37.5)
+			if (ballX + 12 >= paddleX && ballX + 12 < paddleX + 37.5)
 				dx = -5;
-			else if (ballX + 6 >= paddleX + 37.5 && ballX + 6 < paddleX + 75)
+			else if (ballX + 12 >= paddleX + 37.5 && ballX + 12 < paddleX + 75)
 				dx = -3;
-			else if (ballX + 6 >= paddleX + 75 && ballX + 6 < paddleX + 112.5)
+			else if (ballX + 12 >= paddleX + 75 && ballX + 12 < paddleX + 112.5)
 				dx = 3;
-			else if (ballX + 6 >= paddleX + 112.5 && ballX + 6 <= paddleX + 150)
+			else if (ballX + 12 >= paddleX + 112.5 && ballX  <= paddleX + 150)
 				dx = 5;
 		}
 	}
@@ -946,6 +1165,7 @@ void update() {
 
 void draw(RenderWindow& window) {
 	fxTick();
+	audioTick();
 	window.clear();
 	fxBackground(window);
 	fxTrackBricks(true);
@@ -995,6 +1215,7 @@ void draw(RenderWindow& window) {
 
 void drawMenu(RenderWindow& window) {
 	fxTick();
+	audioTick();
 	fxTrackBricks(false);
 
 	window.clear(Color(20, 25, 40));
